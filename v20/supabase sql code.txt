@@ -1,0 +1,353 @@
+-- [FILE: supabase_schema_v2.sql] (Comprehensive Update)
+-- =================================================================
+-- 0. CLEANUP (DROP EXISTING TABLES TO AVOID CONFLICTS)
+-- =================================================================
+DROP TABLE IF EXISTS public.decision_logs CASCADE;
+DROP TABLE IF EXISTS public.transactions CASCADE;
+DROP TABLE IF EXISTS public.payment_sessions CASCADE;
+DROP TABLE IF EXISTS public.reviews CASCADE;
+DROP TABLE IF EXISTS public.notifications CASCADE;
+DROP TABLE IF EXISTS public.messages CASCADE;
+DROP TABLE IF EXISTS public.milestones CASCADE;
+DROP TABLE IF EXISTS public.proposals CASCADE;
+DROP TABLE IF EXISTS public.projects CASCADE;
+DROP TABLE IF EXISTS public.profiles CASCADE;
+
+-- =================================================================
+-- 1. PROFILES (Users & Freelancers)
+-- =================================================================
+create table public.profiles (
+  id uuid references auth.users on delete cascade not null primary key,
+  ghost_id text unique not null,
+  user_type text check (user_type in ('client', 'freelancer')),
+  trust_score int default 100, -- شروع امتیاز از 100
+  skills text[] default '{}',
+  bio text,
+  portfolio jsonb[] default '{}',
+  wallet_address text, -- آدرس کیف پول شخصی کاربر برای تسویه حساب
+  is_blocked boolean default false, -- [NEW] فیلد مسدودسازی کاربر توسط ادمین
+  created_at timestamptz default now()
+);
+alter table profiles enable row level security;
+create policy "Public profiles are viewable by everyone."
+on profiles for select using (true);
+create policy "Users can insert their own profile."
+on profiles for insert with check (auth.uid() = id);
+create policy "Users can update own profile."
+on profiles for update using (auth.uid() = id);
+
+-- =================================================================
+-- 2. PROJECTS (Contracts & Crypto Data)
+-- =================================================================
+create table public.projects (
+  id uuid default gen_random_uuid() primary key,
+  title text not null,
+  description text not null,
+  budget numeric not null,
+  
+  status text default 'open' check (status in ('open', 'hired', 'in_progress', 'review', 'completed', 'disputed', 'cancelled')),
+  
+  skills_required text[] default '{}',
+  client_id uuid references public.profiles(id) not null,
+  freelancer_id uuid references public.profiles(id),
+  
+  -- Crypto & Escrow Fields
+  escrow_status text default 'none' 
+  check (escrow_status in ('none', 'pending', 'locked', 'released', 'refunded', 'disputed')),
+  wallet_index int unique,
+  deposit_address text,
+  chain_id int default 137, -- Polygon Mainnet
+  token_symbol text default 'USDT',
+  
+  created_at timestamptz default now()
+);
+alter table projects enable row level security;
+create policy "Projects are viewable by everyone." on projects for select using (true);
+create policy "Authenticated users can create projects." on projects for insert with check (auth.uid() = client_id);
+create policy "Clients can update their own projects." on projects for update using (auth.uid() = client_id);
+
+-- =================================================================
+-- 3. PROPOSALS
+-- =================================================================
+create table public.proposals (
+  id uuid default gen_random_uuid() primary key,
+  project_id uuid references public.projects(id) on delete cascade not null,
+  freelancer_id uuid references public.profiles(id) not null,
+  
+  cover_letter text,
+  proposed_budget numeric,
+  timeline text,
+  proposed_milestones jsonb default '[]', 
+  
+  status text default 'pending' check (status in ('pending', 'accepted', 'rejected')),
+  created_at timestamptz default now()
+);
+alter table proposals enable row level security;
+create policy "Freelancers view own proposals" on proposals 
+for select using (auth.uid() = freelancer_id);
+create policy "Clients view project proposals" on proposals 
+for select using (
+  exists (select 1 from projects where id = proposals.project_id and client_id = auth.uid())
+);
+create policy "Freelancers insert proposals" on proposals 
+for insert with check (auth.uid() = freelancer_id);
+create policy "Clients update proposals (accept/reject)" on proposals 
+for update using (
+  exists (select 1 from projects where id = proposals.project_id and client_id = auth.uid())
+);
+
+-- =================================================================
+-- 4. MILESTONES (Core for Delivery & Decision Engine)
+-- =================================================================
+create table public.milestones (
+  id uuid default gen_random_uuid() primary key,
+  project_id uuid references public.projects(id) on delete cascade not null,
+  freelancer_id uuid references public.profiles(id) not null,
+  
+  title text not null,
+  amount numeric not null,
+  order_index int not null,
+  
+  -- [UPDATED] شامل تمام وضعیت‌های حروف بزرگ و کوچک برای سازگاری
+  status text default 'pending' 
+  check (status IN (
+    'pending', 'funded', 'submitted', 'approved', 'released', 'disputed', 'cancelled',
+    'ACTIVE', 'LOCKED', 'SUBMITTED', 'COMPLETED', 'DISPUTED'
+  )),
+  
+  due_date timestamptz,
+  deliverables text,
+  verification_method text default 'file', 
+  
+  -- Submission Data (Evidence)
+  submission_file_url text,
+  submission_note text,
+  submission_date timestamptz,
+  
+  -- Decision Engine & Blockchain Proof
+  engine_decision jsonb, -- { action, scores, reasons }
+  decision_hash text, 
+  
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- اطمینان از اعمال CONSTRAINT حتی اگر جدول وجود داشته باشد
+ALTER TABLE public.milestones 
+DROP CONSTRAINT IF EXISTS milestones_status_check;
+
+ALTER TABLE public.milestones
+ADD CONSTRAINT milestones_status_check
+CHECK (status IN (
+  'pending', 'funded', 'submitted', 'approved', 'released', 'disputed', 'cancelled',
+  'ACTIVE', 'LOCKED', 'SUBMITTED', 'COMPLETED', 'DISPUTED'
+));
+
+alter table milestones enable row level security;
+create policy "Public view milestones" on milestones for select using (true);
+
+-- [FIX] اصلاح سیاست دسترسی برای اجازه دادن به کارفرما جهت ایجاد مایلستون جدید
+DROP POLICY IF EXISTS "Enable insert for stakeholders" ON public.milestones;
+CREATE POLICY "Enable insert for stakeholders" 
+ON public.milestones 
+FOR INSERT 
+WITH CHECK (
+  auth.uid() = freelancer_id 
+  OR 
+  EXISTS (
+    SELECT 1 FROM public.projects 
+    WHERE id = project_id 
+    AND client_id = auth.uid()
+  )
+);
+
+create policy "Stakeholders update milestones" on milestones for update using (
+  auth.uid() = freelancer_id OR 
+  exists (select 1 from projects where id = milestones.project_id and client_id = auth.uid())
+);
+
+-- =================================================================
+-- 5. PAYMENT SESSIONS
+-- =================================================================
+create table public.payment_sessions (
+  id uuid default gen_random_uuid() primary key,
+  project_id uuid references public.projects(id),
+  wallet_address text not null,
+  exact_amount numeric not null,
+  token text default 'USDT',
+  expires_at timestamptz not null,
+  created_at timestamptz default now()
+);
+alter table payment_sessions enable row level security;
+create policy "Public view payment sessions" on payment_sessions for select using (true);
+create policy "System inserts sessions" on payment_sessions for insert with check (true);
+
+-- =================================================================
+-- 6. TRANSACTIONS (Ledger & Manual Payout Queue)
+-- =================================================================
+create table public.transactions (
+  id uuid default gen_random_uuid() primary key,
+  project_id uuid references public.projects(id),
+  type text check (type in ('deposit', 'payout', 'refund', 'fee')),
+  amount numeric not null,
+  token text default 'USDT',
+  network text default 'POLYGON',
+  
+  -- Transaction Details
+  tx_hash text, -- [UPDATED] یکتا بودن را برداشتیم تا پرداخت‌های دستی pending امکان‌پذیر باشند
+  from_address text,
+  to_address text,
+  
+  -- Status for Manual Payout Queue
+  status text default 'pending' check (status in ('pending', 'confirmed', 'failed', 'manual_pending', 'manual_done')),
+  
+  created_at timestamptz default now()
+);
+alter table transactions enable row level security;
+create policy "Public transactions view" on transactions for select using (true);
+
+-- =================================================================
+-- 7. DECISION LOGS (AUDIT - Comprehensive)
+-- =================================================================
+create table public.decision_logs (
+  id bigint generated by default as identity primary key,
+  milestone_id uuid references public.milestones(id),
+  project_id uuid references public.projects(id),
+  
+  -- [NEW] فیلدهای دقیق برای لاگ‌گیری کامل سیستم
+  event_type text, -- نوع رویداد (مثلاً STATUS_CHANGE, DISPUTE)
+  actor_id uuid references public.profiles(id), -- شناسه فرد انجام دهنده
+  prev_state jsonb, -- وضعیت قبل
+  next_state jsonb, -- وضعیت بعد
+  
+  -- Scores (Metrics only)
+  delivery_score int,
+  behavior_score int,
+  risk_score int,
+  
+  -- Rules & Reasons
+  rules_triggered text[], -- قوانین فعال شده
+  
+  -- Outcome
+  recommendation text, -- پیشنهاد سیستم
+  final_decision text, -- تصمیم نهایی
+  
+  -- Override Handling
+  is_override boolean default false, 
+  override_reason text, 
+  
+  rule_version text default '2.1.0',
+  created_at timestamptz default now()
+);
+alter table decision_logs enable row level security;
+create policy "Admins view logs" on decision_logs for select using (true);
+create policy "System inserts logs" on decision_logs for insert with check (true);
+
+-- =================================================================
+-- 8. MESSAGES (Chat)
+-- =================================================================
+create table public.messages (
+  id uuid default gen_random_uuid() primary key,
+  project_id uuid references public.projects(id) on delete cascade not null,
+  sender_id uuid references public.profiles(id) not null,
+  recipient_id uuid references public.profiles(id),
+  content text,
+  type text default 'text', 
+  file_url text, -- [NEW] اضافه شدن قابلیت ارسال فایل و تصویر
+  created_at timestamptz default now()
+);
+alter table messages enable row level security;
+create policy "Participants view messages" on messages for select using (
+   auth.uid() = sender_id OR auth.uid() = recipient_id OR
+   exists (select 1 from projects where id = messages.project_id and (client_id = auth.uid() or freelancer_id = auth.uid()))
+);
+create policy "Users insert messages" on messages for insert with check (auth.uid() = sender_id);
+
+-- =================================================================
+-- 9. NOTIFICATIONS & REVIEWS
+-- =================================================================
+create table public.notifications (
+  id bigint generated by default as identity primary key,
+  user_id uuid references auth.users not null,
+  content text not null,
+  link_url text,
+  is_read boolean default false,
+  created_at timestamptz default now()
+);
+
+-- [UPDATED] تنظیم دقیق RLS برای نوتیفیکیشن‌ها
+ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users view own notifications" ON public.notifications;
+DROP POLICY IF EXISTS "System insert notifications" ON public.notifications;
+DROP POLICY IF EXISTS "Users update own notifications" ON public.notifications;
+
+CREATE POLICY "Users view own notifications" 
+ON public.notifications FOR SELECT 
+USING (auth.uid() = user_id);
+
+-- اجازه به کاربران احراز هویت شده برای ارسال نوتیفیکیشن (برای Server Action ها)
+CREATE POLICY "System insert notifications" 
+ON public.notifications FOR INSERT 
+WITH CHECK (auth.role() = 'authenticated');
+
+CREATE POLICY "Users update own notifications" 
+ON public.notifications FOR UPDATE 
+USING (auth.uid() = user_id);
+
+create table public.reviews (
+  id bigint generated by default as identity primary key,
+  reviewer_id uuid references auth.users not null,
+  reviewee_id uuid references auth.users not null,
+  project_id uuid references public.projects(id),
+  rating int not null check (rating >= 1 and rating <= 5),
+  comment text,
+  created_at timestamptz default now()
+);
+alter table reviews enable row level security;
+create policy "Public reviews" on reviews for select using (true);
+create policy "Users insert reviews" on reviews for insert with check (auth.uid() = reviewer_id);
+-- =================================================================
+-- 10. LOG
+-- =================================================================
+
+-- 1. جدول تنظیمات سیستم (برای مدیریت داینامیک فی و آستانه‌ها)
+CREATE TABLE public.system_settings (
+  key text PRIMARY KEY,
+  value jsonb NOT NULL,
+  updated_at timestamptz DEFAULT now(),
+  updated_by uuid REFERENCES auth.users(id)
+);
+
+-- مقادیر پیش‌فرض
+INSERT INTO public.system_settings (key, value) VALUES 
+('escrow_fee_percent', '1'),
+('dispute_threshold_score', '70'),
+('auto_release_days', '7');
+
+-- 2. تضمین Immutability (غیرقابل تغییر بودن) برای لاگ‌ها
+-- حذف دسترسی Update و Delete برای همه روی جدول decision_logs
+REVOKE UPDATE, DELETE ON public.decision_logs FROM public, authenticated, service_role;
+
+-- 3. ایندکس‌گذاری برای سرعت بالای کوئری‌های ادمین
+CREATE INDEX idx_decision_logs_project ON public.decision_logs(project_id);
+CREATE INDEX idx_decision_logs_event_type ON public.decision_logs(event_type);
+CREATE INDEX idx_projects_status ON public.projects(status);
+
+-- 4. ویو (View) برای آمارهای داشبورد (محاسبه سریع)
+CREATE OR REPLACE VIEW admin_stats_view AS
+SELECT 
+  (SELECT COUNT(*) FROM profiles) as total_users,
+  (SELECT COUNT(*) FROM projects) as total_projects,
+  (SELECT COUNT(*) FROM projects WHERE status = 'disputed') as active_disputes,
+  (SELECT COALESCE(SUM(budget), 0) FROM projects WHERE escrow_status = 'locked') as tvl_locked;
+
+-- =================================================================
+-- 11. REALTIME CONFIGURATION
+-- =================================================================
+-- فعال‌سازی قابلیت Realtime برای جداول کلیدی جهت چت زنده و آپدیت‌ها
+alter publication supabase_realtime add table messages;
+alter publication supabase_realtime add table notifications;
+alter publication supabase_realtime add table milestones;
+alter publication supabase_realtime add table projects;
+alter publication supabase_realtime add table transactions;
